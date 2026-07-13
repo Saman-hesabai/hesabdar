@@ -264,7 +264,7 @@ ${JSON.stringify(customers)}
 }
 `.trim();
 
-    const model = "gemini-2.5-flash";
+    const model = "gemini-3-flash-preview";
 
     const geminiResponse = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
