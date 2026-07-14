@@ -237,6 +237,7 @@ Deno.serve(async (req: Request) => {
    - پرسش مانده مشتری: get_balance
    - بدهکارترین مشتری: get_top_debtor
    - نامشخص: unknown
+اگر عملیات بدهی یا پرداخت نیست، مقدار type را "none" بگذار.
 10) confidence عددی بین صفر و یک باشد.
 11) پیام کوتاه و فارسی باشد.
 `.trim();
@@ -251,7 +252,6 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
 
     const responseSchema = {
       type: "object",
-      additionalProperties: false,
       required: [
         "action",
         "type",
@@ -275,8 +275,8 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
           ],
         },
         type: {
-          type: ["string", "null"],
-          enum: ["debt", "payment", null],
+          type: "string",
+          enum: ["debt", "payment", "none"],
         },
         amount: {
           type: "integer",
