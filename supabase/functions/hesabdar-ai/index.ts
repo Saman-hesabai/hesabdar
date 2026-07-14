@@ -7,7 +7,33 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function jsonResponse(data: unknown, status = 200) {
+type CustomerInput =
+  | string
+  | {
+      id?: string;
+      name?: string;
+      full_name?: string;
+      phone?: string;
+    };
+
+type AssistantResult = {
+  action:
+    | "add_transaction"
+    | "add_customer"
+    | "get_balance"
+    | "get_top_debtor"
+    | "unknown";
+  type: "debt" | "payment" | null;
+  amount: number;
+  customer_name: string;
+  description: string;
+  phone: string;
+  needs_confirmation: boolean;
+  confidence: number;
+  message: string;
+};
+
+function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -17,103 +43,129 @@ function jsonResponse(data: unknown, status = 200) {
   });
 }
 
-function normalizeText(value: unknown) {
-  return String(value ?? "")
-    .replace(/ي/g, "ی")
-    .replace(/ك/g, "ک")
-    .replace(/[ۀة]/g, "ه")
+function normalizePersianDigits(value: string): string {
+  const fa = "۰۱۲۳۴۵۶۷۸۹";
+  const ar = "٠١٢٣٤٥٦٧٨٩";
+  return value
+    .replace(/[۰-۹]/g, (d) => String(fa.indexOf(d)))
+    .replace(/[٠-٩]/g, (d) => String(ar.indexOf(d)));
+}
+
+function normalizeText(value: unknown): string {
+  return normalizePersianDigits(String(value ?? ""))
     .replace(/\u200c/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function cleanJson(value: unknown) {
-  return String(value ?? "")
-    .replace(/^\s*```json\s*/i, "")
-    .replace(/^\s*```\s*/i, "")
-    .replace(/\s*```\s*$/i, "")
-    .trim();
-}
-
-function normalizeCustomers(value: unknown) {
+function sanitizeCustomers(value: unknown): Array<{
+  id: string;
+  name: string;
+  phone: string;
+}> {
   if (!Array.isArray(value)) return [];
 
   return value
     .slice(0, 500)
-    .map((customer) => {
-      if (typeof customer === "string") {
+    .map((item: CustomerInput, index) => {
+      if (typeof item === "string") {
         return {
-          id: "",
-          name: normalizeText(customer),
+          id: String(index),
+          name: normalizeText(item),
           phone: "",
         };
       }
 
-      if (customer && typeof customer === "object") {
-        const item = customer as Record<string, unknown>;
-
-        return {
-          id: String(item.id ?? "").trim(),
-          name: normalizeText(item.name),
-          phone: String(item.phone ?? "").trim(),
-        };
-      }
-
       return {
-        id: "",
-        name: "",
-        phone: "",
+        id: normalizeText(item?.id ?? index),
+        name: normalizeText(item?.name ?? item?.full_name ?? ""),
+        phone: normalizeText(item?.phone ?? ""),
       };
     })
-    .filter((customer) => customer.name);
+    .filter((item) => item.name);
+}
+
+function clamp(value: unknown, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
+function cleanResult(value: unknown): AssistantResult {
+  const raw =
+    value && typeof value === "object"
+      ? (value as Record<string, unknown>)
+      : {};
+
+  const allowedActions = new Set([
+    "add_transaction",
+    "add_customer",
+    "get_balance",
+    "get_top_debtor",
+    "unknown",
+  ]);
+
+  const action = allowedActions.has(String(raw.action))
+    ? (String(raw.action) as AssistantResult["action"])
+    : "unknown";
+
+  const type =
+    raw.type === "debt" || raw.type === "payment"
+      ? raw.type
+      : null;
+
+  return {
+    action,
+    type,
+    amount: Math.max(0, Math.round(Number(raw.amount) || 0)),
+    customer_name: normalizeText(raw.customer_name),
+    description: normalizeText(raw.description),
+    phone: normalizeText(raw.phone),
+    needs_confirmation:
+      typeof raw.needs_confirmation === "boolean"
+        ? raw.needs_confirmation
+        : true,
+    confidence: clamp(raw.confidence, 0, 1),
+    message:
+      normalizeText(raw.message) ||
+      "نتیجه آماده شد؛ پیش از ثبت آن را بررسی و تأیید کن.",
+  };
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response("ok", {
-      status: 200,
-      headers: corsHeaders,
-    });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   if (req.method !== "POST") {
     return jsonResponse(
-      {
-        ok: false,
-        error: "فقط درخواست POST مجاز است.",
-      },
+      { ok: false, error: "فقط درخواست POST مجاز است." },
       405,
     );
   }
 
   try {
-    const authorization =
-      req.headers.get("Authorization") ?? "";
+    const authorization = req.headers.get("Authorization") ?? "";
 
-    if (!authorization.startsWith("Bearer ")) {
+    if (!authorization) {
       return jsonResponse(
-        {
-          ok: false,
-          error: "کاربر وارد حساب نشده است.",
-        },
+        { ok: false, error: "کاربر وارد حساب نشده است." },
         401,
       );
     }
 
-    const supabaseUrl =
-      Deno.env.get("SUPABASE_URL") ?? "";
-
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
     const supabaseAnonKey =
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-
-    const geminiApiKey =
-      Deno.env.get("GEMINI_API_KEY") ?? "";
+      Deno.env.get("SUPABASE_ANON_KEY") ??
+      Deno.env.get("SUPABASE_PUBLISHABLE_KEY") ??
+      "";
+    const geminiApiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
 
     if (!supabaseUrl || !supabaseAnonKey) {
       return jsonResponse(
         {
           ok: false,
-          error: "تنظیمات داخلی Supabase کامل نیست.",
+          error: "تنظیمات Supabase در تابع کامل نیست.",
         },
         500,
       );
@@ -124,180 +176,165 @@ Deno.serve(async (req: Request) => {
         {
           ok: false,
           error:
-            "کلید GEMINI_API_KEY در بخش Secrets ذخیره نشده است.",
+            "کلید GEMINI_API_KEY در بخش Edge Function Secrets ذخیره نشده است.",
         },
         500,
       );
     }
 
-    const supabase = createClient(
-      supabaseUrl,
-      supabaseAnonKey,
-      {
-        global: {
-          headers: {
-            Authorization: authorization,
-          },
-        },
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
+    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: {
+        headers: {
+          Authorization: authorization,
         },
       },
-    );
+    });
 
     const {
-      data: userData,
+      data: { user },
       error: userError,
     } = await supabase.auth.getUser();
 
-    if (userError || !userData?.user) {
-      console.error(
-        "User verification error:",
-        userError,
-      );
-
+    if (userError || !user) {
       return jsonResponse(
         {
           ok: false,
-          error:
-            "نشست کاربر معتبر نیست؛ دوباره وارد حساب شوید.",
+          error: "نشست کاربر معتبر نیست؛ دوباره وارد حساب شو.",
         },
         401,
       );
     }
 
-    const body = await req
-      .json()
-      .catch(() => ({}));
+    const body = await req.json().catch(() => ({}));
+    const text = normalizeText(body?.text);
+    const customers = sanitizeCustomers(body?.customers);
 
-    const command = normalizeText(body?.text);
-    const customers = normalizeCustomers(
-      body?.customers,
-    );
-
-    if (!command) {
+    if (!text) {
       return jsonResponse(
-        {
-          ok: false,
-          error: "متن فرمان خالی است.",
-        },
+        { ok: false, error: "متن فرمان خالی است." },
         400,
       );
     }
 
-    const prompt = `
-تو دستیار هوشمند فارسی برنامه فروشگاهی «حسابدار» هستی.
+    const customerNames = customers.map((item) => item.name);
 
-فرمان کاربر را تحلیل کن و فقط JSON معتبر برگردان.
-هیچ توضیح، Markdown یا کدبلاک ننویس.
+    const systemPrompt = `
+تو دستیار هوشمند اپ حسابداری فروشگاه «حسابدار» هستی.
+فرمان فارسی کاربر را تحلیل کن و فقط مطابق JSON Schema خروجی بده.
 
 قواعد:
-
-- واحد مبلغ تومان است.
-- اعداد فارسی، انگلیسی و حروفی را درست تشخیص بده.
-- صد و پنجاه و سه هزار یعنی 153000.
-- ۱۵۳ هزار یعنی 153000.
-- صد تومن در گفتار فروشگاهی معمولاً یعنی 100000.
-- یک میلیون و دویست هزار یعنی 1200000.
-
-debt یعنی:
-نسیه، طلب، بدهی، خرید روی حساب، به حساب اضافه کن، برد.
-
-payment یعنی:
-پرداخت، تسویه، پول داد، واریز، از حساب کم کن.
-
-نام مشتری را از فهرست مشتریان انتخاب کن.
-اگر تلفظ نام کمی اشتباه بود، نزدیک‌ترین نام موجود را انتخاب کن.
-اقلام خرید را فقط در description قرار بده.
-نام مشتری، مبلغ و کلمات فرمان را داخل description نگذار.
-چیزی را از خودت اختراع نکن.
-
-action فقط یکی از این موارد است:
-add_transaction
-get_balance
-today_report
-highest_debtor
-add_customer
-unknown
-
-type فقط یکی از این موارد است:
-debt
-payment
-null
-
-نمونه:
-
-فرمان:
-۱۵۳ هزار تومان پفک و چیپس برای رضا نسیه ثبت کن
-
-خروجی:
-{
-  "action": "add_transaction",
-  "type": "debt",
-  "amount": 153000,
-  "customer_name": "رضا",
-  "description": "پفک و چیپس",
-  "phone": "",
-  "needs_confirmation": true,
-  "confidence": 0.95,
-  "message": ""
-}
-
-فرمان واقعی کاربر:
-${JSON.stringify(command)}
-
-مشتریان موجود:
-${JSON.stringify(customers)}
-
-فقط همین ساختار JSON را برگردان:
-{
-  "action": "unknown",
-  "type": null,
-  "amount": 0,
-  "customer_name": "",
-  "description": "",
-  "phone": "",
-  "needs_confirmation": true,
-  "confidence": 0,
-  "message": ""
-}
+1) مبلغ نهایی همیشه بر حسب تومان و به‌صورت عدد صحیح باشد.
+2) «هزار» یعنی ضربدر 1000 و «میلیون» یعنی ضربدر 1000000.
+3) بدهی، نسیه، برد، خرید کرد و حسابش کن => type برابر debt.
+4) پرداخت، واریز، تسویه، داد و حساب کرد => type برابر payment.
+5) اقلام یا علت خرید را در description نگه دار؛ نام مشتری را داخل description تکرار نکن.
+6) نام مشتری را تا حد ممکن از فهرست مشتریان انتخاب کن.
+7) اگر مشتری قطعی نیست یا چند نام مشابه وجود دارد، needs_confirmation=true.
+8) هیچ تراکنشی را خودت ثبت نکن؛ فقط نتیجه پیشنهادی تولید کن.
+9) action:
+   - ثبت بدهی یا پرداخت: add_transaction
+   - ساخت مشتری: add_customer
+   - پرسش مانده مشتری: get_balance
+   - بدهکارترین مشتری: get_top_debtor
+   - نامشخص: unknown
+10) confidence عددی بین صفر و یک باشد.
+11) پیام کوتاه و فارسی باشد.
 `.trim();
 
-    const model = "gemini-3-flash-preview";
+    const userPrompt = `
+فرمان کاربر:
+${text}
 
-    const geminiResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": geminiApiKey,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
+فهرست نام مشتریان موجود:
+${customerNames.length ? customerNames.join(" | ") : "خالی"}
+`.trim();
+
+    const responseSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "action",
+        "type",
+        "amount",
+        "customer_name",
+        "description",
+        "phone",
+        "needs_confirmation",
+        "confidence",
+        "message",
+      ],
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "add_transaction",
+            "add_customer",
+            "get_balance",
+            "get_top_debtor",
+            "unknown",
           ],
-          generationConfig: {
-            temperature: 0.05,
-            topP: 0.8,
-            maxOutputTokens: 1024,
-            responseMimeType: "application/json",
-          },
-        }),
+        },
+        type: {
+          type: ["string", "null"],
+          enum: ["debt", "payment", null],
+        },
+        amount: {
+          type: "integer",
+          minimum: 0,
+        },
+        customer_name: {
+          type: "string",
+        },
+        description: {
+          type: "string",
+        },
+        phone: {
+          type: "string",
+        },
+        needs_confirmation: {
+          type: "boolean",
+        },
+        confidence: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+        },
+        message: {
+          type: "string",
+        },
       },
-    );
+    };
 
-    const geminiData = await geminiResponse
-      .json()
-      .catch(() => ({}));
+    const model = "gemini-3.5-flash";
+    const endpoint =
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    const geminiResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": geminiApiKey,
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: systemPrompt }],
+        },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: userPrompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 1200,
+          responseMimeType: "application/json",
+          responseSchema,
+        },
+      }),
+    });
+
+    const geminiData = await geminiResponse.json().catch(() => ({}));
 
     if (!geminiResponse.ok) {
       console.error(
@@ -310,135 +347,47 @@ ${JSON.stringify(customers)}
         {
           ok: false,
           error:
-            geminiData?.error?.message ||
-            `ارتباط با Gemini انجام نشد. کد خطا: ${geminiResponse.status}`,
+            geminiData?.error?.message ??
+            `خطای Gemini با کد ${geminiResponse.status}`,
         },
         geminiResponse.status,
       );
     }
 
     const content =
-      geminiData?.candidates?.[0]?.content?.parts
-        ?.map((part: { text?: string }) =>
-          part?.text ?? ""
-        )
-        .join("")
-        .trim() ?? "";
+      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
 
-    if (!content) {
-      console.error(
-        "Empty Gemini response:",
-        JSON.stringify(geminiData),
-      );
-
+    if (!content || typeof content !== "string") {
+      console.error("Empty Gemini response:", JSON.stringify(geminiData));
       return jsonResponse(
-        {
-          ok: false,
-          error: "پاسخ Gemini خالی بود.",
-        },
+        { ok: false, error: "پاسخ Gemini خالی بود." },
         502,
       );
     }
 
-    let parsed: Record<string, unknown>;
+    let parsed: unknown;
 
     try {
-      parsed = JSON.parse(cleanJson(content));
+      parsed = JSON.parse(content);
     } catch (error) {
-      console.error(
-        "Gemini JSON parse error:",
-        error,
-        content,
-      );
-
+      console.error("Gemini JSON parse error:", error, content);
       return jsonResponse(
         {
           ok: false,
-          error: "پاسخ Gemini قابل پردازش نبود.",
-          raw: content,
+          error: "پاسخ ساختاریافته Gemini قابل خواندن نبود.",
         },
         502,
       );
     }
 
-    const allowedActions = [
-      "add_transaction",
-      "get_balance",
-      "today_report",
-      "highest_debtor",
-      "add_customer",
-      "unknown",
-    ];
-
-    const requestedAction =
-      String(parsed.action ?? "").trim();
-
-    const action = allowedActions.includes(
-      requestedAction,
-    )
-      ? requestedAction
-      : "unknown";
-
-    const type =
-      parsed.type === "debt" ||
-      parsed.type === "payment"
-        ? parsed.type
-        : null;
-
-    const rawAmount = Number(parsed.amount ?? 0);
-
-    const amount = Number.isFinite(rawAmount)
-      ? Math.max(0, Math.round(rawAmount))
-      : 0;
-
-    const rawConfidence = Number(
-      parsed.confidence ?? 0,
-    );
-
-    const confidence =
-      Number.isFinite(rawConfidence)
-        ? Math.max(0, Math.min(1, rawConfidence))
-        : 0;
-
-    const result = {
-      action,
-      type,
-      amount,
-      customer_name: normalizeText(
-        parsed.customer_name,
-      ),
-      description: normalizeText(
-        parsed.description,
-      ),
-      phone: String(parsed.phone ?? "").trim(),
-      needs_confirmation:
-        action === "add_transaction"
-          ? true
-          : parsed.needs_confirmation !== false,
-      confidence,
-      message: normalizeText(parsed.message),
-    };
-
-    console.log(
-      "hesabdar-ai success:",
-      JSON.stringify({
-        action: result.action,
-        type: result.type,
-        amount: result.amount,
-        customer_name: result.customer_name,
-        confidence: result.confidence,
-      }),
-    );
+    const result = cleanResult(parsed);
 
     return jsonResponse({
       ok: true,
       result,
     });
   } catch (error) {
-    console.error(
-      "hesabdar-ai unexpected error:",
-      error,
-    );
+    console.error("hesabdar-ai unexpected error:", error);
 
     return jsonResponse(
       {
@@ -446,10 +395,9 @@ ${JSON.stringify(customers)}
         error:
           error instanceof Error
             ? error.message
-            : "خطای ناشناخته در دستیار هوشمند.",
+            : "خطای ناشناخته در دستیار حسابدار.",
       },
       500,
     );
   }
 });
-// trigger deploy Tue Jul 14 00:22:36 +0330 2026
