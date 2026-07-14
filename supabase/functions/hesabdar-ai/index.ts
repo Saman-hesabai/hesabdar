@@ -22,6 +22,8 @@ type AssistantResult = {
     | "add_customer"
     | "get_balance"
     | "get_top_debtor"
+    | "create_check"
+    | "create_reminder"
     | "unknown";
   type: "debt" | "payment" | null;
   amount: number;
@@ -31,6 +33,10 @@ type AssistantResult = {
   needs_confirmation: boolean;
   confidence: number;
   message: string;
+  date_text: string;
+  date_iso: string;
+  due_at: string;
+  remind_days_before: number;
 };
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -102,6 +108,8 @@ function cleanResult(value: unknown): AssistantResult {
     "add_customer",
     "get_balance",
     "get_top_debtor",
+    "create_check",
+    "create_reminder",
     "unknown",
   ]);
 
@@ -129,6 +137,10 @@ function cleanResult(value: unknown): AssistantResult {
     message:
       normalizeText(raw.message) ||
       "نتیجه آماده شد؛ پیش از ثبت آن را بررسی و تأیید کن.",
+    date_text: normalizeText(raw.date_text),
+    date_iso: normalizeText(raw.date_iso),
+    due_at: normalizeText(raw.due_at),
+    remind_days_before: Math.max(0, Math.round(Number(raw.remind_days_before) || 2)),
   };
 }
 
@@ -207,12 +219,22 @@ Deno.serve(async (req: Request) => {
 
     const body = await req.json().catch(() => ({}));
     const text = normalizeText(body?.text);
+    const audioBase64 = String(body?.audio_base64 ?? "").trim();
+    const audioMimeType = normalizeText(body?.audio_mime_type) || "audio/webm";
     const customers = sanitizeCustomers(body?.customers);
+    const currentDate = normalizeText(body?.current_date) || new Date().toISOString();
+    const timezone = normalizeText(body?.timezone) || "Asia/Tehran";
 
-    if (!text) {
+    if (!text && !audioBase64) {
       return jsonResponse(
-        { ok: false, error: "متن فرمان خالی است." },
+        { ok: false, error: "فرمان متنی یا صوتی دریافت نشد." },
         400,
+      );
+    }
+    if (audioBase64.length > 20_000_000) {
+      return jsonResponse(
+        { ok: false, error: "فایل صوتی بیش از حد بزرگ است؛ فرمان را کوتاه‌تر ضبط کن." },
+        413,
       );
     }
 
@@ -236,18 +258,42 @@ Deno.serve(async (req: Request) => {
    - ساخت مشتری: add_customer
    - پرسش مانده مشتری: get_balance
    - بدهکارترین مشتری: get_top_debtor
+   - ثبت چک با تاریخ سررسید: create_check
+   - ساخت یادآوری: create_reminder
    - نامشخص: unknown
 اگر عملیات بدهی یا پرداخت نیست، مقدار type را "none" بگذار.
 10) confidence عددی بین صفر و یک باشد.
 11) پیام کوتاه و فارسی باشد.
+12) برای پرسش مانده تا تاریخ مشخص، date_iso را به شکل YYYY-MM-DD برگردان. اگر کاربر گفت تا امروز، تاریخ امروز را برگردان.
+13) برای چک و یادآوری، due_at را حتماً ISO 8601 کامل برگردان. اگر ساعت گفته نشد، ساعت 09:00 محلی را در نظر بگیر.
+14) برای چک، remind_days_before پیش‌فرض 2 است مگر کاربر عدد دیگری بگوید.
+15) متن فارسی تاریخ فهمیده‌شده را در date_text نگه دار.
+16) برای یادآوری، شرح کامل کار را در description بگذار.
+17) اگر کاربر در یک فرمان گفت مشتری جدید بساز و هم‌زمان مانده/بدهی اولیه هم گفت، action را add_customer بده، مبلغ را در amount و type را debt قرار بده. مثال: «یک مشتری جدید به اسم رضا با مانده بدهی یک میلیون تومان تا امروز ایجاد کن» => action:add_customer, customer_name:رضا, amount:1000000, type:debt.
+18) هر فرمانی که واژه «چک» و تاریخ سررسید دارد حتماً create_check است، نه add_transaction. نام صاحب چک در customer_name، مبلغ در amount و موعد در due_at باشد.
+19) هر فرمانی که با «یادم بنداز»، «یادآوری کن» یا «یادآور» بیان شده حتماً create_reminder است. متن کاری که باید انجام شود در description و زمان در due_at باشد.
+20) اگر کاربر گفت «سه‌شنبه» بدون واژه آینده، نزدیک‌ترین سه‌شنبه بعد از زمان فعلی را انتخاب کن.
+21) برای create_check و create_reminder، date_text و due_at هرگز خالی نباشند. اگر ساعت گفته نشد 09:00 محلی بگذار.
+22) اگر ورودی صوتی است، هیچ تبدیل گفتار به متن مرورگر وجود ندارد؛ خودت فایل صوتی را مستقیماً و کامل گوش کن. مکث، لهجه و گفتن چند قلم کالا نباید باعث حذف بخشی از فرمان شود.
+23) تمام اقلام گفته‌شده را بدون خلاصه‌سازی ناقص در description نگه دار و اگر کاربر جمع کل را گفته همان مبلغ را مبنا قرار بده.
+24) منظور طبیعی کاربر مهم‌تر از عبارت‌های ثابت است؛ فرمان را مثل یک دستیار حسابدار واقعی تفسیر کن.
 `.trim();
 
     const userPrompt = `
-فرمان کاربر:
-${text}
+فرمان متنی کاربر:
+${text || "فرمان به‌صورت فایل صوتی ارسال شده است؛ ابتدا خود صدا را دقیق بشنو و سپس منظور کامل کاربر را تحلیل کن."}
+
+تاریخ و ساعت فعلی:
+${currentDate}
+منطقه زمانی: ${timezone}
 
 فهرست نام مشتریان موجود:
 ${customerNames.length ? customerNames.join(" | ") : "خالی"}
+
+نمونه‌های قطعی:
+- «مشتری جدید رضا با مانده بدهی یک میلیون بساز» => add_customer با amount=1000000 و type=debt
+- «چک رضا 100 میلیون برای 25 مهر ثبت کن» => create_check
+- «سه شنبه یادم بنداز برای علی پول بزنم» => create_reminder
 `.trim();
 
     const responseSchema = {
@@ -262,6 +308,10 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
         "needs_confirmation",
         "confidence",
         "message",
+        "date_text",
+        "date_iso",
+        "due_at",
+        "remind_days_before",
       ],
       properties: {
         action: {
@@ -271,6 +321,8 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
             "add_customer",
             "get_balance",
             "get_top_debtor",
+            "create_check",
+            "create_reminder",
             "unknown",
           ],
         },
@@ -299,9 +351,11 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
           minimum: 0,
           maximum: 1,
         },
-        message: {
-          type: "string",
-        },
+        message: { type: "string" },
+        date_text: { type: "string" },
+        date_iso: { type: "string" },
+        due_at: { type: "string" },
+        remind_days_before: { type: "integer", minimum: 0, maximum: 30 },
       },
     };
 
@@ -322,7 +376,12 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
         contents: [
           {
             role: "user",
-            parts: [{ text: userPrompt }],
+            parts: [
+              { text: userPrompt },
+              ...(audioBase64
+                ? [{ inlineData: { mimeType: audioMimeType, data: audioBase64 } }]
+                : []),
+            ],
           },
         ],
         generationConfig: {
@@ -384,6 +443,7 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
 
     return jsonResponse({
       ok: true,
+      server_version: "v1.2.1",
       result,
     });
   } catch (error) {
