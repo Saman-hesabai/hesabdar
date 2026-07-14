@@ -21,6 +21,7 @@ type AssistantResult = {
     | "add_transaction"
     | "add_customer"
     | "get_balance"
+    | "set_balance"
     | "get_top_debtor"
     | "create_check"
     | "create_reminder"
@@ -107,6 +108,7 @@ function cleanResult(value: unknown): AssistantResult {
     "add_transaction",
     "add_customer",
     "get_balance",
+    "set_balance",
     "get_top_debtor",
     "create_check",
     "create_reminder",
@@ -257,6 +259,7 @@ Deno.serve(async (req: Request) => {
    - ثبت بدهی یا پرداخت: add_transaction
    - ساخت مشتری: add_customer
    - پرسش مانده مشتری: get_balance
+   - تغییر مانده حساب مشتری به مبلغ مشخص: set_balance
    - بدهکارترین مشتری: get_top_debtor
    - ثبت چک با تاریخ سررسید: create_check
    - ساخت یادآوری: create_reminder
@@ -277,6 +280,7 @@ Deno.serve(async (req: Request) => {
 22) اگر ورودی صوتی است، هیچ تبدیل گفتار به متن مرورگر وجود ندارد؛ خودت فایل صوتی را مستقیماً و کامل گوش کن. مکث، لهجه و گفتن چند قلم کالا نباید باعث حذف بخشی از فرمان شود.
 23) تمام اقلام گفته‌شده را بدون خلاصه‌سازی ناقص در description نگه دار و اگر کاربر جمع کل را گفته همان مبلغ را مبنا قرار بده.
 24) منظور طبیعی کاربر مهم‌تر از عبارت‌های ثابت است؛ فرمان را مثل یک دستیار حسابدار واقعی تفسیر کن.
+25) اگر کاربر گفت «مانده حساب فلانی را به مبلغ X تغییر بده/تنظیم کن/بکن»، action حتماً set_balance باشد، customer_name نام مشتری و amount مانده نهایی موردنظر باشد. این فرمان add_transaction یا get_balance نیست. مثال: «مانده حساب رجب امرایی رو به 15 میلیون و 100 هزار تومان تغییر بده» => action:set_balance, amount:15100000.
 `.trim();
 
     const userPrompt = `
@@ -320,6 +324,7 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
             "add_transaction",
             "add_customer",
             "get_balance",
+            "set_balance",
             "get_top_debtor",
             "create_check",
             "create_reminder",
@@ -427,13 +432,41 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
     let parsed: unknown;
 
     try {
-      parsed = JSON.parse(content);
+      // Gemini گاهی JSON را داخل code fence یا همراه متن اضافه برمی‌گرداند.
+      // این بخش پاسخ را تمیز می‌کند و اولین شیء JSON معتبر را بیرون می‌کشد.
+      const cleaned = content
+        .replace(/```json/gi, "")
+        .replace(/```/g, "")
+        .trim();
+
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      const candidate =
+        firstBrace >= 0 && lastBrace > firstBrace
+          ? cleaned.slice(firstBrace, lastBrace + 1)
+          : cleaned;
+
+      try {
+        parsed = JSON.parse(candidate);
+      } catch {
+        // اصلاح خطاهای رایج: ویرگول اضافه، کوتیشن هوشمند و بسته‌نشدن آکولاد.
+        let repaired = candidate
+          .replace(/[“”]/g, '"')
+          .replace(/[‘’]/g, "'")
+          .replace(/,\s*([}\]])/g, "$1");
+
+        const opens = (repaired.match(/{/g) || []).length;
+        const closes = (repaired.match(/}/g) || []).length;
+        if (opens > closes) repaired += "}".repeat(opens - closes);
+
+        parsed = JSON.parse(repaired);
+      }
     } catch (error) {
       console.error("Gemini JSON parse error:", error, content);
       return jsonResponse(
         {
           ok: false,
-          error: "پاسخ ساختاریافته Gemini قابل خواندن نبود.",
+          error: "پاسخ Gemini ناقص بود؛ دوباره فرمان را ارسال کن.",
         },
         502,
       );
@@ -443,7 +476,7 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
 
     return jsonResponse({
       ok: true,
-      server_version: "v1.2.1",
+      server_version: "v1.2.4",
       result,
     });
   } catch (error) {
