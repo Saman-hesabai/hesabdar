@@ -368,37 +368,66 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
     const endpoint =
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-    const geminiResponse = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": geminiApiKey,
+    const requestBody = JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: systemPrompt }],
       },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: userPrompt },
+            ...(audioBase64
+              ? [{ inlineData: { mimeType: audioMimeType, data: audioBase64 } }]
+              : []),
+          ],
         },
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: userPrompt },
-              ...(audioBase64
-                ? [{ inlineData: { mimeType: audioMimeType, data: audioBase64 } }]
-                : []),
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0,
-          maxOutputTokens: 1200,
-          responseMimeType: "application/json",
-          responseSchema,
-        },
-      }),
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 1200,
+        responseMimeType: "application/json",
+        responseSchema,
+      },
     });
 
-    const geminiData = await geminiResponse.json().catch(() => ({}));
+    async function callGemini() {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": geminiApiKey,
+        },
+        body: requestBody,
+      });
+      const data = await response.json().catch(() => ({}));
+      return { response, data };
+    }
+
+    function getRetryDelaySeconds(data: any): number {
+      const message = String(data?.error?.message ?? "");
+      const messageMatch = message.match(/retry\s+in\s+([0-9.]+)s/i);
+      if (messageMatch) return Math.ceil(Number(messageMatch[1]) || 0);
+
+      const details = Array.isArray(data?.error?.details) ? data.error.details : [];
+      for (const detail of details) {
+        const retryDelay = String(detail?.retryDelay ?? "");
+        const detailMatch = retryDelay.match(/([0-9.]+)s/i);
+        if (detailMatch) return Math.ceil(Number(detailMatch[1]) || 0);
+      }
+      return 0;
+    }
+
+    let { response: geminiResponse, data: geminiData } = await callGemini();
+
+    // در محدودیت موقت سهمیه، فقط یک بار پس از زمان پیشنهادی Gemini تلاش مجدد می‌کنیم.
+    if (geminiResponse.status === 429) {
+      const suggestedDelay = getRetryDelaySeconds(geminiData);
+      const retryAfter = Math.min(35, Math.max(2, suggestedDelay || 5));
+      console.warn(`Gemini quota reached; retrying once after ${retryAfter}s`);
+      await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+      ({ response: geminiResponse, data: geminiData } = await callGemini());
+    }
 
     if (!geminiResponse.ok) {
       console.error(
@@ -407,12 +436,26 @@ ${customerNames.length ? customerNames.join(" | ") : "خالی"}
         JSON.stringify(geminiData),
       );
 
+      if (geminiResponse.status === 429) {
+        const retryAfter = Math.max(5, getRetryDelaySeconds(geminiData) || 30);
+        return jsonResponse(
+          {
+            ok: false,
+            code: "GEMINI_QUOTA_EXCEEDED",
+            retry_after_seconds: retryAfter,
+            error: `دستیار فعلاً شلوغ است. حدود ${retryAfter} ثانیه دیگر دوباره امتحان کن.`,
+          },
+          429,
+        );
+      }
+
       return jsonResponse(
         {
           ok: false,
           error:
-            geminiData?.error?.message ??
-            `خطای Gemini با کد ${geminiResponse.status}`,
+            geminiData?.error?.message
+              ? "در ارتباط با دستیار هوشمند مشکلی پیش آمد. کمی بعد دوباره امتحان کن."
+              : `خطای Gemini با کد ${geminiResponse.status}`,
         },
         geminiResponse.status,
       );
